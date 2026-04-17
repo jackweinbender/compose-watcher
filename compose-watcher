@@ -117,6 +117,45 @@ startup_scan() {
     log INFO "startup scan complete" "dir=$WATCH_DIR"
 }
 
+# Run inotifywait in monitor mode and dispatch events.
+# Returns when a new subdirectory is detected so the caller can restart with updated watches.
+event_loop() {
+    inotifywait -m -r \
+        --format '%w%f %e' \
+        -e close_write \
+        -e moved_to \
+        -e delete \
+        -e create \
+        "$WATCH_DIR" 2>/dev/null |
+    while IFS=' ' read -r filepath event; do
+        # New directory — signal caller to restart inotifywait with updated watches
+        if [[ "$event" == *ISDIR* ]]; then
+            log INFO "new directory, reinitializing watcher" "path=$filepath"
+            break
+        fi
+
+        # Only act on .yml and .yaml files
+        case "$filepath" in
+            *.yml|*.yaml) ;;
+            *) continue ;;
+        esac
+
+        local project
+        project=$(project_name "$WATCH_DIR" "$filepath")
+
+        log INFO "event" "event=$event" "path=$filepath" "project=$project"
+
+        case "$event" in
+            CLOSE_WRITE*|MOVED_TO*)
+                compose_upsert "$project" "$filepath"
+                ;;
+            DELETE*)
+                compose_cleanup "$project"
+                ;;
+        esac
+    done
+}
+
 main() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -130,6 +169,13 @@ main() {
     mkdir -p "$LOCK_DIR"
     log INFO "starting compose-watcher" "watch_dir=$WATCH_DIR" "log_format=$LOG_FORMAT"
     startup_scan
+
+    log INFO "watching for changes" "dir=$WATCH_DIR"
+    while true; do
+        event_loop
+        log INFO "restarting watcher" "dir=$WATCH_DIR"
+        sleep 1
+    done
 }
 
 usage() {
