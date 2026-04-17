@@ -1,155 +1,72 @@
 #!/usr/bin/env bash
-# compose-watcher — daemon that watches a directory tree for Docker Compose files
-# and automatically brings stacks up or down as files appear, change, or are deleted.
-#
-# Dependencies: inotifywait (inotify-tools), docker (with compose plugin), flock
-#
-# Expected layout under WATCH_DIR:
-#   <repo>/<stack>.yml   →  project name: <repo>-<stack>
-#   <stack>.yml          →  project name: <stack>
+# compose-watcher: watch a directory for docker-compose files.
+# Drop a .yml → `docker compose up`. Remove it → `docker compose down -v --rmi local`.
+# Depends on: inotifywait (inotify-tools), docker compose, flock.
+# Env: WATCH_DIR (default /etc/compose-stacks), LOCK_DIR (default /run/compose-watcher).
 set -euo pipefail
+trap 'exit 0' INT TERM
 
 WATCH_DIR="${WATCH_DIR:-/etc/compose-stacks}"
 LOCK_DIR="${LOCK_DIR:-/run/compose-watcher}"
 
-log() {
-    local level="$1" msg="$2"; shift 2
-    printf '%s %s' "$level" "$msg"
-    printf ' %s' "$@"
-    printf '\n'
-}
-
-# Derive a unique Docker Compose project name from a file path.
+# Project name from path relative to watch root.
 #   /etc/compose-stacks/repo-a/pr-123.yml  → repo-a-pr-123
 #   /etc/compose-stacks/standalone.yml     → standalone
 project_name() {
-    local rel="${2#${1}/}"
-    local dir stem; dir=$(dirname "$rel"); stem=$(basename "$rel"); stem="${stem%.*}"
-    if [[ "$dir" == "." ]]; then printf '%s' "$stem"
-    else printf '%s' "${dir}-${stem}"
-    fi
+    local rel="${2#${1}/}" dir stem
+    dir=$(dirname "$rel"); stem=$(basename "$rel"); stem="${stem%.*}"
+    [[ "$dir" == "." ]] && echo "$stem" || echo "$dir-$stem"
 }
 
-# Runs in background; per-project flock prevents concurrent deploys.
-compose_upsert() {
-    local project="$1" file="$2"
-    local lock="${LOCK_DIR}/${project}.lock"
-    (
-        exec 9>"$lock"
-        if ! flock -n 9; then
-            log INFO "compose up skipped: operation already in progress" "project=$project"
-            exit 0
-        fi
-        log INFO "compose up starting" "project=$project" "file=$file"
-        local rc
-        docker compose -p "$project" -f "$file" up -d --remove-orphans > /dev/null 2>&1 && rc=0 || rc=$?
-        if [[ $rc -eq 0 ]]; then log INFO  "compose up complete" "project=$project"
-        else                      log ERROR "compose up failed"   "project=$project" "exit_code=$rc"
-        fi
-    ) &
+# Run in background; per-project flock prevents concurrent ops.
+compose_up() {
+    ( exec 9>"$LOCK_DIR/$1.lock"
+      flock -n 9 || exit 0
+      echo "INFO up starting project=$1 file=$2"
+      if docker compose -p "$1" -f "$2" up -d --remove-orphans >/dev/null 2>&1
+      then echo "INFO up complete project=$1"
+      else echo "ERROR up failed project=$1 exit_code=$?"
+      fi ) &
 }
 
-# Runs in background; per-project flock prevents concurrent runs.
-# NOTE: docker prune is host-wide, not scoped to this project.
-compose_cleanup() {
-    local project="$1"
-    local lock="${LOCK_DIR}/${project}.lock"
-    (
-        exec 9>"$lock"
-        if ! flock -n 9; then
-            log INFO "compose down skipped: operation already in progress" "project=$project"
-            exit 0
-        fi
-        log INFO "compose down starting" "project=$project"
-        local rc
-        docker compose -p "$project" down -v > /dev/null 2>&1 && rc=0 || rc=$?
-        if [[ $rc -eq 0 ]]; then log INFO  "compose down complete" "project=$project"
-        else                      log ERROR "compose down failed"   "project=$project" "exit_code=$rc"
-        fi
-        log INFO "pruning dangling resources" "project=$project"
-        for resource in image container volume; do
-            docker "$resource" prune -f > /dev/null 2>&1 || true
-        done
-    ) &
+compose_down() {
+    ( exec 9>"$LOCK_DIR/$1.lock"
+      flock -n 9 || exit 0
+      echo "INFO down starting project=$1"
+      if docker compose -p "$1" down -v --rmi local >/dev/null 2>&1
+      then echo "INFO down complete project=$1"
+      else echo "ERROR down failed project=$1 exit_code=$?"
+      fi ) &
 }
 
-# Find all .yml/.yaml files under WATCH_DIR and run compose_upsert on each.
-# Runs at daemon startup to bring up any stacks that existed before the daemon started.
+# Upsert every existing .yml/.yaml — makes daemon restarts idempotent.
 startup_scan() {
-    while IFS= read -r -d '' file; do
-        local project
-        project=$(project_name "$WATCH_DIR" "$file")
-        log INFO "startup: upserting stack" "project=$project" "file=$file"
-        compose_upsert "$project" "$file"
+    while IFS= read -r -d '' f; do
+        compose_up "$(project_name "$WATCH_DIR" "$f")" "$f"
     done < <(find "$WATCH_DIR" \( -name '*.yml' -o -name '*.yaml' \) -print0 2>/dev/null)
 }
 
 # Runs inotifywait in monitor mode. Exits when a new subdirectory appears
-# so the caller can restart with updated watches. File CREATE is ignored; CLOSE_WRITE is used instead.
+# so the caller can restart with updated watches (inotify doesn't auto-recurse).
 event_loop() {
-    inotifywait -m -r \
-        --format '%w%f %e' \
-        -e close_write \
-        -e moved_to \
-        -e delete \
-        -e create \
+    inotifywait -mr --format '%w%f %e' \
+        -e close_write -e moved_to -e delete -e create \
         "$WATCH_DIR" 2>/dev/null |
-    while IFS=' ' read -r filepath event; do
-        # New directory — break so the caller restarts inotifywait with updated watches.
-        if [[ "$event" == *ISDIR* ]]; then
-            log INFO "new directory, reinitializing watcher" "path=$filepath"
-            break
-        fi
-
-        case "$filepath" in *.yml|*.yaml) ;; *) continue ;; esac
-
-        local project
-        project=$(project_name "$WATCH_DIR" "$filepath")
-        log INFO "event" "event=$event" "path=$filepath" "project=$project"
-
+    while IFS=' ' read -r path event; do
+        [[ "$event" == *ISDIR* ]] && { echo "INFO new dir path=$path"; break; }
+        case "$path" in *.yml|*.yaml) ;; *) continue;; esac
+        local p; p=$(project_name "$WATCH_DIR" "$path")
+        echo "INFO event=$event path=$path project=$p"
         case "$event" in
-            CLOSE_WRITE*|MOVED_TO*)  compose_upsert  "$project" "$filepath" ;;
-            DELETE*)                 compose_cleanup "$project" ;;
+            CLOSE_WRITE*|MOVED_TO*) compose_up   "$p" "$path" ;;
+            DELETE*)                compose_down "$p" ;;
         esac
     done
 }
 
-usage() {
-    cat <<'EOF'
-Usage: compose-watcher [OPTIONS]
-
-Options:
-  --watch-dir DIR    Root directory to watch recursively (default: /etc/compose-stacks)
-                     Also configurable via WATCH_DIR env var.
-  -h, --help         Show this help
-
-Environment variables:
-  WATCH_DIR    Same as --watch-dir
-  LOCK_DIR     Directory for per-project lock files (default: /run/compose-watcher)
-EOF
-}
-
-main() {
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --watch-dir)  WATCH_DIR="$2"; shift 2 ;;
-            -h|--help)    usage; exit 0 ;;
-            *) printf 'Unknown flag: %s\n' "$1" >&2; usage >&2; exit 1 ;;
-        esac
-    done
-
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     mkdir -p "$LOCK_DIR"
-    log INFO "starting compose-watcher" "watch_dir=$WATCH_DIR"
+    echo "INFO starting watch_dir=$WATCH_DIR"
     startup_scan
-
-    # event_loop exits when it detects a new subdirectory (inotifywait doesn't
-    # auto-watch new directories). We restart in a loop to pick up the new watch.
-    log INFO "watching for changes" "dir=$WATCH_DIR"
-    while true; do
-        event_loop
-        log INFO "restarting watcher" "dir=$WATCH_DIR"
-        sleep 1
-    done
-}
-
-if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main "$@"; fi
+    while true; do event_loop; sleep 1; done
+fi

@@ -14,15 +14,6 @@ assert_eq() {
 
 source "$(dirname "$0")/../compose-watcher"
 
-assert_eq "script is sourceable" "ok" "ok"
-
-# --- log ---
-out=$(log INFO "something happened" "k=v")
-assert_eq "log has level"   "1" "$(grep -c 'INFO'              <<< "$out")"
-assert_eq "log has msg"     "1" "$(grep -c 'something happened' <<< "$out")"
-assert_eq "log has kv"      "1" "$(grep -c 'k=v'               <<< "$out")"
-
-# --- project_name ---
 assert_eq "subdir/file.yml" \
     "repo-a-pr-123" \
     "$(project_name /etc/compose-stacks /etc/compose-stacks/repo-a/pr-123.yml)"
