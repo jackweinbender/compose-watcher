@@ -27,6 +27,21 @@ log() {
     fi
 }
 
+# Derive a unique Docker Compose project name from a file path.
+# Example: /etc/compose-stacks/repo-a/pr-123.yml → repo-a-pr-123
+project_name() {
+    local watch_root="$1" file="$2"
+    local rel="${file#${watch_root}/}"
+    local dir; dir=$(dirname "$rel")
+    local base; base=$(basename "$rel")
+    local stem="${base%.*}"
+    if [[ "$dir" == "." ]]; then
+        printf '%s' "$stem"
+    else
+        printf '%s' "${dir}-${stem}"
+    fi
+}
+
 main() {
     while [[ $# -gt 0 ]]; do
         case "$1" in

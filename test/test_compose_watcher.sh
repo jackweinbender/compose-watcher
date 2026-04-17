@@ -37,5 +37,26 @@ escaped_out=$(log INFO 'say "hello"' 'path=a\b')
 assert_eq "json escapes quotes"     "1" "$(grep -c '"msg":"say \\"hello\\""'  <<< "$escaped_out")"
 assert_eq "json escapes backslash"  "1" "$(grep -c '"path":"a\\\\b"'          <<< "$escaped_out")"
 
+# --- project_name ---
+assert_eq "subdir/file.yml" \
+    "repo-a-pr-123" \
+    "$(project_name /etc/compose-stacks /etc/compose-stacks/repo-a/pr-123.yml)"
+
+assert_eq "subdir/file.yaml" \
+    "repo-b-pr-456" \
+    "$(project_name /etc/compose-stacks /etc/compose-stacks/repo-b/pr-456.yaml)"
+
+assert_eq "underscore prefix" \
+    "repo-a-_traefik" \
+    "$(project_name /etc/compose-stacks /etc/compose-stacks/repo-a/_traefik.yml)"
+
+assert_eq "file directly in watch root" \
+    "standalone" \
+    "$(project_name /etc/compose-stacks /etc/compose-stacks/standalone.yml)"
+
+assert_eq "multi-dot stem" \
+    "repo-a-multi.service" \
+    "$(project_name /etc/compose-stacks /etc/compose-stacks/repo-a/multi.service.yml)"
+
 echo ""; echo "Results: $PASS passed, $FAIL failed"
 [[ $FAIL -eq 0 ]]
