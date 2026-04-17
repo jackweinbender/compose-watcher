@@ -104,6 +104,19 @@ compose_cleanup() {
     ) &
 }
 
+# Find all .yml/.yaml files under WATCH_DIR and run compose_upsert on each.
+# Runs at daemon startup to bring up any stacks that existed before the daemon started.
+startup_scan() {
+    log INFO "startup scan starting" "dir=$WATCH_DIR"
+    while IFS= read -r -d '' file; do
+        local project
+        project=$(project_name "$WATCH_DIR" "$file")
+        log INFO "startup: upserting stack" "project=$project" "file=$file"
+        compose_upsert "$project" "$file"
+    done < <(find "$WATCH_DIR" \( -name '*.yml' -o -name '*.yaml' \) -print0 2>/dev/null)
+    log INFO "startup scan complete" "dir=$WATCH_DIR"
+}
+
 main() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -113,7 +126,10 @@ main() {
             *) printf 'Unknown flag: %s\n' "$1" >&2; usage >&2; exit 1 ;;
         esac
     done
-    printf 'compose-watcher starting\n'
+
+    mkdir -p "$LOCK_DIR"
+    log INFO "starting compose-watcher" "watch_dir=$WATCH_DIR" "log_format=$LOG_FORMAT"
+    startup_scan
 }
 
 usage() {
