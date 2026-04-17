@@ -10,50 +10,27 @@
 set -euo pipefail
 
 WATCH_DIR="${WATCH_DIR:-/etc/compose-stacks}"
-LOG_FORMAT="${LOG_FORMAT:-json}"
 LOCK_DIR="${LOCK_DIR:-/run/compose-watcher}"
 
-# Escape backslashes first, then double-quotes — order matters: if quotes were
-# escaped first, the newly inserted backslashes would be double-escaped.
-_json_esc() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
-
-# log LEVEL MESSAGE [key=value ...]
-# Writes a structured log line to stdout.
 log() {
     local level="$1" msg="$2"; shift 2
-    local ts; ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-    if [[ "$LOG_FORMAT" == "json" ]]; then
-        local j="{\"time\":\"$ts\",\"level\":\"$level\",\"msg\":\"$(_json_esc "$msg")\""
-        while [[ $# -gt 0 ]]; do
-            j+=",\"${1%%=*}\":\"$(_json_esc "${1#*=}")\""
-            shift
-        done
-        printf '%s\n' "${j}}"
-    else
-        local kv=""
-        while [[ $# -gt 0 ]]; do kv+=" $1"; shift; done
-        printf '%s  %-5s  %s%s\n' "$ts" "$level" "$msg" "$kv"
-    fi
+    printf '%s %s' "$level" "$msg"
+    printf ' %s' "$@"
+    printf '\n'
 }
 
 # Derive a unique Docker Compose project name from a file path.
-# Example: /etc/compose-stacks/repo-a/pr-123.yml → repo-a-pr-123
+#   /etc/compose-stacks/repo-a/pr-123.yml  → repo-a-pr-123
+#   /etc/compose-stacks/standalone.yml     → standalone
 project_name() {
-    local watch_root="$1" file="$2"
-    local rel_path="${file#${watch_root}/}"
-    local rel_dir; rel_dir=$(dirname "$rel_path")
-    local stem; stem=$(basename "$rel_path")
-    stem="${stem%.*}"
-    if [[ "$rel_dir" == "." ]]; then
-        printf '%s' "$stem"
-    else
-        printf '%s' "${rel_dir}-${stem}"
+    local rel="${2#${1}/}"
+    local dir stem; dir=$(dirname "$rel"); stem=$(basename "$rel"); stem="${stem%.*}"
+    if [[ "$dir" == "." ]]; then printf '%s' "$stem"
+    else printf '%s' "${dir}-${stem}"
     fi
 }
 
-# Run `docker compose up -d --remove-orphans` in a background subshell.
-# Acquires a per-project flock lock; skips if the lock is already held.
-# This prevents two simultaneous deploys for the same project.
+# Runs in background; per-project flock prevents concurrent deploys.
 compose_upsert() {
     local project="$1" file="$2"
     local lock="${LOCK_DIR}/${project}.lock"
@@ -64,24 +41,16 @@ compose_upsert() {
             exit 0
         fi
         log INFO "compose up starting" "project=$project" "file=$file"
-        local output rc
-        # Capture output and exit code without triggering set -e on failure.
-        output=$(docker compose -p "$project" -f "$file" up -d --remove-orphans 2>&1) && rc=0 || rc=$?
-        while IFS= read -r line; do
-            [[ -n "$line" ]] && log INFO "$line" "project=$project"
-        done <<< "$output"
-        if [[ $rc -eq 0 ]]; then
-            log INFO "compose up complete" "project=$project"
-        else
-            log ERROR "compose up failed" "project=$project" "exit_code=$rc"
+        local rc
+        docker compose -p "$project" -f "$file" up -d --remove-orphans > /dev/null 2>&1 && rc=0 || rc=$?
+        if [[ $rc -eq 0 ]]; then log INFO  "compose up complete" "project=$project"
+        else                      log ERROR "compose up failed"   "project=$project" "exit_code=$rc"
         fi
     ) &
 }
 
-# Run `docker compose down -v` then prune dangling resources, in a background subshell.
-# Acquires a per-project flock lock; skips if the lock is already held.
-# NOTE: docker prune commands are host-wide — they remove all stopped/dangling
-# resources across every project, not only the one being cleaned up.
+# Runs in background; per-project flock prevents concurrent runs.
+# NOTE: docker prune is host-wide, not scoped to this project.
 compose_cleanup() {
     local project="$1"
     local lock="${LOCK_DIR}/${project}.lock"
@@ -92,47 +61,31 @@ compose_cleanup() {
             exit 0
         fi
         log INFO "compose down starting" "project=$project"
-        local output rc
-        # Capture output and exit code without triggering set -e on failure.
-        output=$(docker compose -p "$project" down -v 2>&1) && rc=0 || rc=$?
-        while IFS= read -r line; do
-            [[ -n "$line" ]] && log INFO "$line" "project=$project"
-        done <<< "$output"
-        if [[ $rc -eq 0 ]]; then
-            log INFO "compose down complete" "project=$project"
-        else
-            log ERROR "compose down failed" "project=$project" "exit_code=$rc"
+        local rc
+        docker compose -p "$project" down -v > /dev/null 2>&1 && rc=0 || rc=$?
+        if [[ $rc -eq 0 ]]; then log INFO  "compose down complete" "project=$project"
+        else                      log ERROR "compose down failed"   "project=$project" "exit_code=$rc"
         fi
         log INFO "pruning dangling resources" "project=$project"
         for resource in image container volume; do
-            local prune_out
-            prune_out=$(docker "$resource" prune -f 2>&1) || true
-            while IFS= read -r line; do
-                [[ -n "$line" ]] && log INFO "$line" "resource=$resource"
-            done <<< "$prune_out"
+            docker "$resource" prune -f > /dev/null 2>&1 || true
         done
-        log INFO "prune complete" "project=$project"
     ) &
 }
 
 # Find all .yml/.yaml files under WATCH_DIR and run compose_upsert on each.
 # Runs at daemon startup to bring up any stacks that existed before the daemon started.
 startup_scan() {
-    log INFO "startup scan starting" "dir=$WATCH_DIR"
     while IFS= read -r -d '' file; do
         local project
         project=$(project_name "$WATCH_DIR" "$file")
         log INFO "startup: upserting stack" "project=$project" "file=$file"
         compose_upsert "$project" "$file"
     done < <(find "$WATCH_DIR" \( -name '*.yml' -o -name '*.yaml' \) -print0 2>/dev/null)
-    log INFO "startup scan complete" "dir=$WATCH_DIR"
 }
 
-# Run inotifywait in monitor mode and dispatch events.
-# Returns when a new subdirectory is detected so the caller can restart
-# inotifywait with updated watches covering the new directory.
-# CREATE events for files are watched but intentionally ignored — we wait
-# for CLOSE_WRITE instead to avoid acting on partial writes.
+# Runs inotifywait in monitor mode. Exits when a new subdirectory appears
+# so the caller can restart with updated watches. File CREATE is ignored; CLOSE_WRITE is used instead.
 event_loop() {
     inotifywait -m -r \
         --format '%w%f %e' \
@@ -148,24 +101,15 @@ event_loop() {
             break
         fi
 
-        # Only act on .yml and .yaml files
-        case "$filepath" in
-            *.yml|*.yaml) ;;
-            *) continue ;;
-        esac
+        case "$filepath" in *.yml|*.yaml) ;; *) continue ;; esac
 
         local project
         project=$(project_name "$WATCH_DIR" "$filepath")
-
         log INFO "event" "event=$event" "path=$filepath" "project=$project"
 
         case "$event" in
-            CLOSE_WRITE*|MOVED_TO*)
-                compose_upsert "$project" "$filepath"
-                ;;
-            DELETE*)
-                compose_cleanup "$project"
-                ;;
+            CLOSE_WRITE*|MOVED_TO*)  compose_upsert  "$project" "$filepath" ;;
+            DELETE*)                 compose_cleanup "$project" ;;
         esac
     done
 }
@@ -177,34 +121,25 @@ Usage: compose-watcher [OPTIONS]
 Options:
   --watch-dir DIR    Root directory to watch recursively (default: /etc/compose-stacks)
                      Also configurable via WATCH_DIR env var.
-  --log-format FMT   Log format: json or text (default: json)
-                     Also configurable via LOG_FORMAT env var.
   -h, --help         Show this help
 
 Environment variables:
-  WATCH_DIR          Same as --watch-dir
-  LOG_FORMAT         Same as --log-format
-  LOCK_DIR           Directory for per-project lock files (default: /run/compose-watcher)
+  WATCH_DIR    Same as --watch-dir
+  LOCK_DIR     Directory for per-project lock files (default: /run/compose-watcher)
 EOF
 }
 
 main() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --watch-dir)   WATCH_DIR="$2";   shift 2 ;;
-            --log-format)  LOG_FORMAT="$2";  shift 2 ;;
-            -h|--help)     usage; exit 0 ;;
+            --watch-dir)  WATCH_DIR="$2"; shift 2 ;;
+            -h|--help)    usage; exit 0 ;;
             *) printf 'Unknown flag: %s\n' "$1" >&2; usage >&2; exit 1 ;;
         esac
     done
 
-    if [[ "$LOG_FORMAT" != "json" && "$LOG_FORMAT" != "text" ]]; then
-        printf 'Invalid --log-format: %s (must be json or text)\n' "$LOG_FORMAT" >&2
-        exit 1
-    fi
-
     mkdir -p "$LOCK_DIR"
-    log INFO "starting compose-watcher" "watch_dir=$WATCH_DIR" "log_format=$LOG_FORMAT"
+    log INFO "starting compose-watcher" "watch_dir=$WATCH_DIR"
     startup_scan
 
     # event_loop exits when it detects a new subdirectory (inotifywait doesn't
