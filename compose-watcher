@@ -1,11 +1,20 @@
 #!/usr/bin/env bash
+# compose-watcher — daemon that watches a directory tree for Docker Compose files
+# and automatically brings stacks up or down as files appear, change, or are deleted.
+#
+# Dependencies: inotifywait (inotify-tools), docker (with compose plugin), flock
+#
+# Expected layout under WATCH_DIR:
+#   <repo>/<stack>.yml   →  project name: <repo>-<stack>
+#   <stack>.yml          →  project name: <stack>
 set -euo pipefail
 
 WATCH_DIR="${WATCH_DIR:-/etc/compose-stacks}"
 LOG_FORMAT="${LOG_FORMAT:-json}"
 LOCK_DIR="${LOCK_DIR:-/run/compose-watcher}"
 
-# Escape backslashes and double quotes for use inside a JSON string.
+# Escape backslashes first, then double-quotes — order matters: if quotes were
+# escaped first, the newly inserted backslashes would be double-escaped.
 _json_esc() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
 
 # log LEVEL MESSAGE [key=value ...]
@@ -31,14 +40,14 @@ log() {
 # Example: /etc/compose-stacks/repo-a/pr-123.yml → repo-a-pr-123
 project_name() {
     local watch_root="$1" file="$2"
-    local rel="${file#${watch_root}/}"
-    local dir; dir=$(dirname "$rel")
-    local base; base=$(basename "$rel")
-    local stem="${base%.*}"
-    if [[ "$dir" == "." ]]; then
+    local rel_path="${file#${watch_root}/}"
+    local rel_dir; rel_dir=$(dirname "$rel_path")
+    local stem; stem=$(basename "$rel_path")
+    stem="${stem%.*}"
+    if [[ "$rel_dir" == "." ]]; then
         printf '%s' "$stem"
     else
-        printf '%s' "${dir}-${stem}"
+        printf '%s' "${rel_dir}-${stem}"
     fi
 }
 
@@ -48,7 +57,6 @@ project_name() {
 compose_upsert() {
     local project="$1" file="$2"
     local lock="${LOCK_DIR}/${project}.lock"
-    mkdir -p "$LOCK_DIR"
     (
         exec 9>"$lock"
         if ! flock -n 9; then
@@ -57,6 +65,7 @@ compose_upsert() {
         fi
         log INFO "compose up starting" "project=$project" "file=$file"
         local output rc
+        # Capture output and exit code without triggering set -e on failure.
         output=$(docker compose -p "$project" -f "$file" up -d --remove-orphans 2>&1) && rc=0 || rc=$?
         while IFS= read -r line; do
             [[ -n "$line" ]] && log INFO "$line" "project=$project"
@@ -71,10 +80,11 @@ compose_upsert() {
 
 # Run `docker compose down -v` then prune dangling resources, in a background subshell.
 # Acquires a per-project flock lock; skips if the lock is already held.
+# NOTE: docker prune commands are host-wide — they remove all stopped/dangling
+# resources across every project, not only the one being cleaned up.
 compose_cleanup() {
     local project="$1"
     local lock="${LOCK_DIR}/${project}.lock"
-    mkdir -p "$LOCK_DIR"
     (
         exec 9>"$lock"
         if ! flock -n 9; then
@@ -83,6 +93,7 @@ compose_cleanup() {
         fi
         log INFO "compose down starting" "project=$project"
         local output rc
+        # Capture output and exit code without triggering set -e on failure.
         output=$(docker compose -p "$project" down -v 2>&1) && rc=0 || rc=$?
         while IFS= read -r line; do
             [[ -n "$line" ]] && log INFO "$line" "project=$project"
@@ -118,7 +129,10 @@ startup_scan() {
 }
 
 # Run inotifywait in monitor mode and dispatch events.
-# Returns when a new subdirectory is detected so the caller can restart with updated watches.
+# Returns when a new subdirectory is detected so the caller can restart
+# inotifywait with updated watches covering the new directory.
+# CREATE events for files are watched but intentionally ignored — we wait
+# for CLOSE_WRITE instead to avoid acting on partial writes.
 event_loop() {
     inotifywait -m -r \
         --format '%w%f %e' \
@@ -128,7 +142,7 @@ event_loop() {
         -e create \
         "$WATCH_DIR" 2>/dev/null |
     while IFS=' ' read -r filepath event; do
-        # New directory — signal caller to restart inotifywait with updated watches
+        # New directory — break so the caller restarts inotifywait with updated watches.
         if [[ "$event" == *ISDIR* ]]; then
             log INFO "new directory, reinitializing watcher" "path=$filepath"
             break
@@ -156,28 +170,6 @@ event_loop() {
     done
 }
 
-main() {
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --watch-dir)   WATCH_DIR="$2";   shift 2 ;;
-            --log-format)  LOG_FORMAT="$2";  shift 2 ;;
-            -h|--help)     usage; exit 0 ;;
-            *) printf 'Unknown flag: %s\n' "$1" >&2; usage >&2; exit 1 ;;
-        esac
-    done
-
-    mkdir -p "$LOCK_DIR"
-    log INFO "starting compose-watcher" "watch_dir=$WATCH_DIR" "log_format=$LOG_FORMAT"
-    startup_scan
-
-    log INFO "watching for changes" "dir=$WATCH_DIR"
-    while true; do
-        event_loop
-        log INFO "restarting watcher" "dir=$WATCH_DIR"
-        sleep 1
-    done
-}
-
 usage() {
     cat <<'EOF'
 Usage: compose-watcher [OPTIONS]
@@ -188,7 +180,41 @@ Options:
   --log-format FMT   Log format: json or text (default: json)
                      Also configurable via LOG_FORMAT env var.
   -h, --help         Show this help
+
+Environment variables:
+  WATCH_DIR          Same as --watch-dir
+  LOG_FORMAT         Same as --log-format
+  LOCK_DIR           Directory for per-project lock files (default: /run/compose-watcher)
 EOF
+}
+
+main() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --watch-dir)   WATCH_DIR="$2";   shift 2 ;;
+            --log-format)  LOG_FORMAT="$2";  shift 2 ;;
+            -h|--help)     usage; exit 0 ;;
+            *) printf 'Unknown flag: %s\n' "$1" >&2; usage >&2; exit 1 ;;
+        esac
+    done
+
+    if [[ "$LOG_FORMAT" != "json" && "$LOG_FORMAT" != "text" ]]; then
+        printf 'Invalid --log-format: %s (must be json or text)\n' "$LOG_FORMAT" >&2
+        exit 1
+    fi
+
+    mkdir -p "$LOCK_DIR"
+    log INFO "starting compose-watcher" "watch_dir=$WATCH_DIR" "log_format=$LOG_FORMAT"
+    startup_scan
+
+    # event_loop exits when it detects a new subdirectory (inotifywait doesn't
+    # auto-watch new directories). We restart in a loop to pick up the new watch.
+    log INFO "watching for changes" "dir=$WATCH_DIR"
+    while true; do
+        event_loop
+        log INFO "restarting watcher" "dir=$WATCH_DIR"
+        sleep 1
+    done
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main "$@"; fi
