@@ -8,6 +8,9 @@ WATCH_DIR="${WATCH_DIR:-/etc/compose-stacks}"
 UNIT_FILE="/etc/systemd/system/compose-watcher.service"
 REPO="jackweinbender/compose-watcher"
 
+# Use sudo only when not already root.
+maybe_sudo() { [ "$(id -u)" -eq 0 ] && "$@" || sudo "$@"; }
+
 need() { command -v "$1" >/dev/null 2>&1 || { echo "ERROR: $1 is required but not installed." >&2; exit 1; }; }
 
 need curl
@@ -20,16 +23,17 @@ if ! command -v inotifywait >/dev/null 2>&1; then
 fi
 
 echo "==> Downloading compose-watcher..."
-curl -fsSL "https://raw.githubusercontent.com/${REPO}/main/compose-watcher" \
-    -o "$INSTALL_BIN"
-chmod +x "$INSTALL_BIN"
+tmp=$(mktemp)
+curl -fsSL "https://raw.githubusercontent.com/${REPO}/main/compose-watcher" -o "$tmp"
+maybe_sudo install -m 755 "$tmp" "$INSTALL_BIN"
+rm -f "$tmp"
 echo "    Installed to $INSTALL_BIN"
 
 echo "==> Creating watch directory $WATCH_DIR..."
-mkdir -p "$WATCH_DIR"
+maybe_sudo mkdir -p "$WATCH_DIR"
 
 echo "==> Installing systemd unit..."
-cat > "$UNIT_FILE" <<EOF
+maybe_sudo sh -c "cat > '$UNIT_FILE'" <<EOF
 [Unit]
 Description=compose-watcher
 After=docker.service
@@ -45,8 +49,8 @@ RestartSec=5s
 WantedBy=multi-user.target
 EOF
 
-systemctl daemon-reload
-systemctl enable --now compose-watcher
+maybe_sudo systemctl daemon-reload
+maybe_sudo systemctl enable --now compose-watcher
 
 echo ""
 echo "compose-watcher is running. Logs:"
