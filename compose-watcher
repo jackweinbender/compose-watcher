@@ -42,6 +42,68 @@ project_name() {
     fi
 }
 
+# Run `docker compose up -d --remove-orphans` in a background subshell.
+# Acquires a per-project flock lock; skips if the lock is already held.
+# This prevents two simultaneous deploys for the same project.
+compose_upsert() {
+    local project="$1" file="$2"
+    local lock="${LOCK_DIR}/${project}.lock"
+    mkdir -p "$LOCK_DIR"
+    (
+        exec 9>"$lock"
+        if ! flock -n 9; then
+            log INFO "compose up skipped: operation already in progress" "project=$project"
+            exit 0
+        fi
+        log INFO "compose up starting" "project=$project" "file=$file"
+        local output rc
+        output=$(docker compose -p "$project" -f "$file" up -d --remove-orphans 2>&1) && rc=0 || rc=$?
+        while IFS= read -r line; do
+            [[ -n "$line" ]] && log INFO "$line" "project=$project"
+        done <<< "$output"
+        if [[ $rc -eq 0 ]]; then
+            log INFO "compose up complete" "project=$project"
+        else
+            log ERROR "compose up failed" "project=$project" "exit_code=$rc"
+        fi
+    ) &
+}
+
+# Run `docker compose down -v` then prune dangling resources, in a background subshell.
+# Acquires a per-project flock lock; skips if the lock is already held.
+compose_cleanup() {
+    local project="$1"
+    local lock="${LOCK_DIR}/${project}.lock"
+    mkdir -p "$LOCK_DIR"
+    (
+        exec 9>"$lock"
+        if ! flock -n 9; then
+            log INFO "compose down skipped: operation already in progress" "project=$project"
+            exit 0
+        fi
+        log INFO "compose down starting" "project=$project"
+        local output rc
+        output=$(docker compose -p "$project" down -v 2>&1) && rc=0 || rc=$?
+        while IFS= read -r line; do
+            [[ -n "$line" ]] && log INFO "$line" "project=$project"
+        done <<< "$output"
+        if [[ $rc -eq 0 ]]; then
+            log INFO "compose down complete" "project=$project"
+        else
+            log ERROR "compose down failed" "project=$project" "exit_code=$rc"
+        fi
+        log INFO "pruning dangling resources" "project=$project"
+        for resource in image container volume; do
+            local prune_out
+            prune_out=$(docker "$resource" prune -f 2>&1) || true
+            while IFS= read -r line; do
+                [[ -n "$line" ]] && log INFO "$line" "resource=$resource"
+            done <<< "$prune_out"
+        done
+        log INFO "prune complete" "project=$project"
+    ) &
+}
+
 main() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
