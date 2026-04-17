@@ -49,7 +49,7 @@ sudo dnf install inotify-tools
 ### YOLO
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/jackweinbender/compose-watcher/main/install.sh | sudo sh
+curl -fsSL https://raw.githubusercontent.com/jackweinbender/compose-watcher/main/install.sh | sh
 ```
 
 Downloads the script, installs it to `/usr/local/bin`, creates `/etc/compose-stacks`, and enables the systemd service. Requires `inotify-tools`, `docker`, and `flock`.
