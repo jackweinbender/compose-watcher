@@ -5,6 +5,28 @@ WATCH_DIR="${WATCH_DIR:-/etc/compose-stacks}"
 LOG_FORMAT="${LOG_FORMAT:-json}"
 LOCK_DIR="${LOCK_DIR:-/run/compose-watcher}"
 
+# Escape backslashes and double quotes for use inside a JSON string.
+_json_esc() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+
+# log LEVEL MESSAGE [key=value ...]
+# Writes a structured log line to stdout.
+log() {
+    local level="$1" msg="$2"; shift 2
+    local ts; ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    if [[ "$LOG_FORMAT" == "json" ]]; then
+        local j="{\"time\":\"$ts\",\"level\":\"$level\",\"msg\":\"$(_json_esc "$msg")\""
+        while [[ $# -gt 0 ]]; do
+            j+=",\"${1%%=*}\":\"$(_json_esc "${1#*=}")\""
+            shift
+        done
+        printf '%s\n' "${j}}"
+    else
+        local kv=""
+        while [[ $# -gt 0 ]]; do kv+=" $1"; shift; done
+        printf '%s  %-5s  %s%s\n' "$ts" "$level" "$msg" "$kv"
+    fi
+}
+
 main() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
