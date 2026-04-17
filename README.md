@@ -5,7 +5,7 @@ A lightweight Linux daemon that manages Docker Compose stacks by watching a dire
 ## How it works
 
 - **File created or modified** → `docker compose up -d --remove-orphans`
-- **File deleted** → `docker compose down -v` → prune dangling images, containers, and volumes
+- **File deleted** → `docker compose down -v --rmi local`
 
 The daemon watches a directory tree recursively using `inotifywait`. File writes are detected via `close_write` (triggered when scp finishes writing). Each active compose operation holds a per-project lock file (`flock`); if a second event arrives while an operation is still running, it is skipped. On startup the daemon scans the watch root and runs `compose up` on all existing `.yml`/`.yaml` files, making daemon restarts idempotent.
 
@@ -54,12 +54,12 @@ sudo install -m 755 compose-watcher /usr/local/bin/compose-watcher
 
 ## Configuration
 
-| Flag | Environment variable | Default | Description |
-|---|---|---|---|
-| `--watch-dir` | `WATCH_DIR` | `/etc/compose-stacks` | Root directory to watch recursively |
-| `--log-format` | `LOG_FORMAT` | `json` | `json` or `text` |
+All configuration is via environment variables.
 
-Lock files are written to `/run/compose-watcher/` by default. This directory is on tmpfs and is cleared on reboot, so stale locks from crashed processes are automatically removed. Override with the `LOCK_DIR` environment variable.
+| Variable | Default | Description |
+|---|---|---|
+| `WATCH_DIR` | `/etc/compose-stacks` | Root directory to watch recursively |
+| `LOCK_DIR` | `/run/compose-watcher` | Per-project lock files (on tmpfs; stale locks clear on reboot) |
 
 ## systemd setup
 
@@ -78,7 +78,8 @@ After=docker.service
 Requires=docker.service
 
 [Service]
-ExecStart=/usr/local/bin/compose-watcher --watch-dir=/etc/compose-stacks
+Environment=WATCH_DIR=/etc/compose-stacks
+ExecStart=/usr/local/bin/compose-watcher
 Restart=on-failure
 RestartSec=5s
 
@@ -117,12 +118,20 @@ sudo journalctl -fu compose-watcher
 
 ## Logging
 
-JSON by default (`--log-format=text` for development). All Docker CLI output is captured and emitted as individual log lines. Example:
+Plain-text log lines written to stdout. journald captures these and adds its own timestamps. Format is `LEVEL message key=value ...`:
 
-```json
-{"time":"2026-04-16T12:00:00Z","level":"INFO","msg":"compose up complete","project":"repo-a-pr-123"}
-{"time":"2026-04-16T12:01:00Z","level":"INFO","msg":"event","event":"DELETE","path":"/etc/compose-stacks/repo-a/pr-123.yml","project":"repo-a-pr-123"}
 ```
+INFO starting watch_dir=/etc/compose-stacks
+INFO up starting project=repo-a-pr-123 file=/etc/compose-stacks/repo-a/pr-123.yml
+INFO up complete project=repo-a-pr-123
+INFO event=DELETE path=/etc/compose-stacks/repo-a/pr-123.yml project=repo-a-pr-123
+INFO down starting project=repo-a-pr-123
+INFO down complete project=repo-a-pr-123
+```
+
+Docker's own output is suppressed; operators can run `docker compose -p <project> logs` or `docker compose -p <project> up -d` manually to see stack-level detail.
+
+For cleanup of dangling images accumulated during rebuilds, schedule a periodic `docker system prune -f` via cron or a systemd timer — this is deliberately not done by the daemon so its cleanup is strictly project-scoped.
 
 ## Adding a new repo
 
