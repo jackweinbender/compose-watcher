@@ -42,8 +42,8 @@ Requires=docker.service
 [Service]
 Environment=WATCH_DIR=$WATCH_DIR
 ExecStart=$INSTALL_BIN
-Restart=on-failure
-RestartSec=5s
+Restart=always
+RestartSec=2s
 
 [Install]
 WantedBy=multi-user.target

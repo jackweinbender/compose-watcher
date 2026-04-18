@@ -44,7 +44,8 @@ startup_scan() {
 }
 
 # Runs inotifywait in monitor mode. Exits when a new subdirectory appears
-# so the caller can restart with updated watches (inotify doesn't auto-recurse).
+# so systemd restarts us with fresh recursive watches + a fresh startup_scan
+# (inotify doesn't auto-recurse into dirs created after the watch starts).
 event_loop() {
     inotifywait -mr --format '%w%f %e' \
         -e close_write -e moved_to -e delete -e create \
@@ -69,5 +70,5 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     mkdir -p "$LOCK_DIR"
     echo "INFO starting watch_dir=$WATCH_DIR"
     startup_scan
-    while true; do event_loop; sleep 1; done
+    event_loop
 fi
