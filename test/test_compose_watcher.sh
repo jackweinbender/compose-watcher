@@ -104,8 +104,13 @@ rm -f "$_CALLS"
 _BIN_DIR=$(mktemp -d)
 cat > "$_BIN_DIR/inotifywait" <<'EOF'
 #!/usr/bin/env bash
-# Fake inotifywait: emit a single CREATE,ISDIR event and exit.
+# Fake inotifywait that mimics `-m` monitor mode: emits one CREATE,ISDIR and
+# then blocks forever with SIGPIPE ignored — matching how a real inotifywait
+# behaves under systemd (IgnoreSIGPIPE=true). If event_loop doesn't explicitly
+# kill this process after `break`, the parent script hangs and `timeout` fires.
+trap '' PIPE
 echo "/fake/new-dir/ CREATE,ISDIR"
+while true; do sleep 1; done
 EOF
 chmod +x "$_BIN_DIR/inotifywait"
 
