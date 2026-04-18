@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# compose-watcher: watch a directory for docker-compose files.
-# Drop a .yml → `docker compose up`. Remove it → `docker compose down -v --rmi local`.
+# compose-watcher: watch a directory for docker-compose project folders.
+# Drop a folder with a .yml → `docker compose up`. Remove the folder → `docker compose down -v --rmi local`.
 # Depends on: inotifywait (inotify-tools), docker compose, flock.
 # Env: WATCH_DIR (default /etc/compose-stacks), LOCK_DIR (default /run/compose-watcher).
 set -euo pipefail
@@ -9,13 +9,10 @@ trap 'exit 0' INT TERM
 WATCH_DIR="${WATCH_DIR:-/etc/compose-stacks}"
 LOCK_DIR="${LOCK_DIR:-/run/compose-watcher}"
 
-# Project name from path relative to watch root.
-#   /etc/compose-stacks/repo-a/pr-123.yml  → repo-a-pr-123
-#   /etc/compose-stacks/standalone.yml     → standalone
+# Project name = immediate subdirectory under watch root.
+#   /etc/compose-stacks/myproject/docker-compose.yml  → myproject
 project_name() {
-    local rel="${2#${1}/}" dir stem
-    dir=$(dirname "$rel"); stem=$(basename "$rel"); stem="${stem%.*}"
-    [[ "$dir" == "." ]] && echo "$stem" || echo "$dir-$stem"
+    echo "${2#${1}/}" | cut -d/ -f1
 }
 
 # Run in background; per-project flock prevents concurrent ops.
@@ -39,11 +36,11 @@ compose_down() {
       fi ) &
 }
 
-# Upsert every existing .yml/.yaml — makes daemon restarts idempotent.
+# Upsert every existing .yml/.yaml one level deep — makes daemon restarts idempotent.
 startup_scan() {
     while IFS= read -r -d '' f; do
         compose_up "$(project_name "$WATCH_DIR" "$f")" "$f"
-    done < <(find "$WATCH_DIR" \( -name '*.yml' -o -name '*.yaml' \) -print0 2>/dev/null)
+    done < <(find "$WATCH_DIR" -mindepth 2 -maxdepth 2 \( -name '*.yml' -o -name '*.yaml' \) -print0 2>/dev/null)
 }
 
 # Runs inotifywait in monitor mode. Exits when a new subdirectory appears
@@ -53,7 +50,11 @@ event_loop() {
         -e close_write -e moved_to -e delete -e create \
         "$WATCH_DIR" 2>/dev/null |
     while IFS=' ' read -r path event; do
-        [[ "$event" == *ISDIR* ]] && { echo "INFO new dir path=$path"; break; }
+        if [[ "$event" == *ISDIR* ]]; then
+            [[ "$event" == DELETE* ]] && compose_down "$(project_name "$WATCH_DIR" "$path")" || { echo "INFO new dir path=$path"; break; }
+            continue
+        fi
+        [[ "$(dirname "$path")" == "$WATCH_DIR" ]] && continue
         case "$path" in *.yml|*.yaml) ;; *) continue;; esac
         local p; p=$(project_name "$WATCH_DIR" "$path")
         echo "INFO event=$event path=$path project=$p"
