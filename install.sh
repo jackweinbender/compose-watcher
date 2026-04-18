@@ -42,15 +42,16 @@ Requires=docker.service
 [Service]
 Environment=WATCH_DIR=$WATCH_DIR
 ExecStart=$INSTALL_BIN
-Restart=on-failure
-RestartSec=5s
+Restart=always
+RestartSec=2s
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
 maybe_sudo systemctl daemon-reload
-maybe_sudo systemctl enable --now compose-watcher
+maybe_sudo systemctl enable compose-watcher
+maybe_sudo systemctl restart compose-watcher
 
 echo ""
 echo "compose-watcher is running. Logs:"
