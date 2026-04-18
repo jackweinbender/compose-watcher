@@ -43,14 +43,19 @@ startup_scan() {
     done < <(find "$WATCH_DIR" -mindepth 2 -maxdepth 2 \( -name '*.yml' -o -name '*.yaml' \) -print0 2>/dev/null)
 }
 
-# Runs inotifywait in monitor mode. Exits when a new subdirectory appears
+# Runs inotifywait in monitor mode. Returns when a new subdirectory appears
 # so systemd restarts us with fresh recursive watches + a fresh startup_scan
 # (inotify doesn't auto-recurse into dirs created after the watch starts).
+#
+# Uses process substitution + explicit kill rather than `cmd | while` because
+# systemd ignores SIGPIPE by default: a closed pipe read end wouldn't kill
+# inotifywait, and `bash` would wait on the pipeline forever.
 event_loop() {
-    inotifywait -mr --format '%w%f %e' \
+    exec 3< <(inotifywait -mr --format '%w%f %e' \
         -e close_write -e moved_to -e delete -e create \
-        "$WATCH_DIR" 2>/dev/null |
-    while IFS=' ' read -r path event; do
+        "$WATCH_DIR" 2>/dev/null)
+    local pid=$!
+    while IFS=' ' read -r path event <&3; do
         if [[ "$event" == *ISDIR* ]]; then
             [[ "$event" == DELETE* ]] && compose_down "$(project_name "$WATCH_DIR" "$path")" || { echo "INFO new dir path=$path"; break; }
             continue
@@ -64,6 +69,8 @@ event_loop() {
             DELETE*)                compose_down "$p" ;;
         esac
     done
+    kill "$pid" 2>/dev/null || true
+    exec 3<&-
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
