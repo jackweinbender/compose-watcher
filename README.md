@@ -90,8 +90,8 @@ Requires=docker.service
 [Service]
 Environment=WATCH_DIR=/etc/compose-stacks
 ExecStart=/usr/local/bin/compose-watcher
-Restart=on-failure
-RestartSec=5s
+Restart=always
+RestartSec=2s
 
 [Install]
 WantedBy=multi-user.target
