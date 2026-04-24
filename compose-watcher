@@ -20,9 +20,10 @@ compose_up() {
     ( exec 9>"$LOCK_DIR/$1.lock"
       flock -n 9 || exit 0
       echo "INFO up starting project=$1 file=$2"
-      if docker compose -p "$1" -f "$2" up -d --remove-orphans >/dev/null 2>&1
-      then echo "INFO up complete project=$1"
-      else echo "ERROR up failed project=$1 exit_code=$?"
+      if docker compose -p "$1" -f "$2" up -d --remove-orphans >/dev/null 2>&1; then
+          echo "INFO up complete project=$1"
+      else
+          local rc=$?; echo "ERROR up failed project=$1 exit_code=$rc"
       fi ) &
 }
 
@@ -30,9 +31,10 @@ compose_down() {
     ( exec 9>"$LOCK_DIR/$1.lock"
       flock -n 9 || exit 0
       echo "INFO down starting project=$1"
-      if docker compose -p "$1" down -v --rmi local >/dev/null 2>&1
-      then echo "INFO down complete project=$1"
-      else echo "ERROR down failed project=$1 exit_code=$?"
+      if docker compose -p "$1" down -v --rmi local >/dev/null 2>&1; then
+          echo "INFO down complete project=$1"
+      else
+          local rc=$?; echo "ERROR down failed project=$1 exit_code=$rc"
       fi ) &
 }
 
